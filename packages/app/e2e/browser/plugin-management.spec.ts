@@ -778,49 +778,63 @@ test("keeps Reload pending past a minute while the plugin queue is busy", async 
     release: path.join(directory, "build-release"),
   };
   const repository = await createGatedBuildRepository(directory, gate);
-  const queuedInstall = client.installPluginSource({
-    source: `git:${pathToFileURL(repository).href}`,
-  });
-  await expect.poll(() => existsSync(gate.started), { timeout: 30_000 }).toBe(true);
+  let queuedInstall: Promise<unknown> | undefined;
+  try {
+    queuedInstall = client.installPluginSource({
+      source: `git:${pathToFileURL(repository).href}`,
+    });
+    await expect.poll(() => existsSync(gate.started), { timeout: 30_000 }).toBe(true);
 
-  const actionsButton = page.getByRole("button", { name: "Actions for e2e-plugin", exact: true });
-  await selectPluginAction(page, "e2e-plugin", "Reload");
-  await expect.poll(() => reloadRequests.length, { timeout: 30_000 }).toBe(1);
-  // Pending: the row's actions stay disabled, so a second reload cannot be submitted.
-  await expect(actionsButton).toBeDisabled();
-  await page.screenshot({
-    path: testInfo.outputPath("plugin-reload-pending.png"),
-    fullPage: true,
-    animations: "disabled",
-  });
+    const actionsButton = page.getByRole("button", {
+      name: "Actions for e2e-plugin",
+      exact: true,
+    });
+    await selectPluginAction(page, "e2e-plugin", "Reload");
+    await expect.poll(() => reloadRequests.length, { timeout: 30_000 }).toBe(1);
+    // Pending: the row's actions stay disabled, so a second reload cannot be submitted.
+    await expect(actionsButton).toBeDisabled();
+    await page.screenshot({
+      path: testInfo.outputPath("plugin-reload-pending.png"),
+      fullPage: true,
+      animations: "disabled",
+    });
 
-  const requestedAt = reloadRequests[0]!;
-  const remaining = 66_000 - (Date.now() - requestedAt);
-  if (remaining > 0) await page.waitForTimeout(remaining);
+    const requestedAt = reloadRequests[0]!;
+    const remaining = 66_000 - (Date.now() - requestedAt);
+    if (remaining > 0) await page.waitForTimeout(remaining);
 
-  // Past the former deadline the reload is still pending, the row shows its previous state, and
-  // no timeout error reached the surface.
-  await expect(actionsButton).toBeDisabled();
-  await expect(page.getByLabel("e2e-plugin running")).toBeVisible();
-  await expect(page.getByTestId("plugin-management-feedback")).toHaveCount(0);
-  await page.screenshot({
-    path: testInfo.outputPath("plugin-reload-past-deadline.png"),
-    fullPage: true,
-    animations: "disabled",
-  });
+    // Past the former deadline the reload is still pending, the row shows its previous state, and
+    // no timeout error reached the surface.
+    await expect(actionsButton).toBeDisabled();
+    await expect(page.getByLabel("e2e-plugin running")).toBeVisible();
+    await expect(page.getByTestId("plugin-management-feedback")).toHaveCount(0);
+    await page.screenshot({
+      path: testInfo.outputPath("plugin-reload-past-deadline.png"),
+      fullPage: true,
+      animations: "disabled",
+    });
 
-  await writeFile(gate.release, "go");
-  // The daemon's answer only arrives once the plugin really started again. It carries the result
-  // the row waited for; a request timeout would have shown up as feedback during the wait above.
-  await expect.poll(() => reloadResponses.length, { timeout: 120_000 }).toBe(1);
-  expect(reloadRequests.length).toBe(1);
-  await expect(page.getByTestId("plugin-management-feedback")).toContainText("Reloaded e2e-plugin");
-  await page.screenshot({
-    path: testInfo.outputPath("plugin-reload-completed.png"),
-    fullPage: true,
-    animations: "disabled",
-  });
+    await writeFile(gate.release, "go");
+    // The daemon's answer only arrives once the plugin really started again. It carries the result
+    // the row waited for; a request timeout would have shown up as feedback during the wait above.
+    await expect.poll(() => reloadResponses.length, { timeout: 120_000 }).toBe(1);
+    expect(reloadRequests.length).toBe(1);
+    await expect(page.getByTestId("plugin-management-feedback")).toContainText(
+      "Reloaded e2e-plugin",
+    );
+    await expect(actionsButton).toBeEnabled();
+    await page.screenshot({
+      path: testInfo.outputPath("plugin-reload-completed.png"),
+      fullPage: true,
+      animations: "disabled",
+    });
 
-  await queuedInstall;
-  await client.removePlugin("gated-build-plugin");
+    await queuedInstall;
+    await client.removePlugin("gated-build-plugin");
+  } finally {
+    // Release the gated build even when an assertion failed: the daemon's plugin lifecycle queue
+    // would otherwise stay blocked, and the fixture's own cleanup would time out behind it.
+    await writeFile(gate.release, "go").catch(() => undefined);
+    await queuedInstall?.catch(() => undefined);
+  }
 });
