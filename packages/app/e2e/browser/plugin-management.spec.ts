@@ -765,14 +765,23 @@ async function holdPluginLifecycleQueue(
   };
   const repository = await createGatedBuildRepository(root, gate);
   const install = client.installPluginSource({ source: `git:${pathToFileURL(repository).href}` });
+  // The marker wait below can outlive an early failure: a refused preparation, a dropped
+  // connection, or a build command that exits before writing its marker. Handle that rejection now
+  // so it never surfaces as an unhandled one, and drain the same promise in finish().
+  const installDrained = install.catch(() => undefined);
   // Every path releases the gate and drains the install: a build still polling for its gate holds
   // the daemon's plugin lifecycle queue open, and the fixture's own plugin removal would stall.
   const finish = async () => {
     await writeFile(gate.release, "go").catch(() => undefined);
-    await install.catch(() => undefined);
+    await installDrained;
   };
   try {
-    await expect.poll(() => existsSync(gate.started), { timeout: 30_000 }).toBe(true);
+    // Whichever comes first decides the scenario: the build reports that it started, or the setup
+    // fails with the daemon's own error instead of a bare marker timeout.
+    await Promise.race([
+      expect.poll(() => existsSync(gate.started), { timeout: 30_000 }).toBe(true),
+      install,
+    ]);
   } catch (error) {
     // Setup that never reached the build must not hand the caller a queue it cannot settle.
     await finish();
