@@ -2149,6 +2149,12 @@ test("rejects a pending plugin reload when the connection closes", async () => {
   mock.triggerClose({ code: 1006, reason: "network lost" });
 
   await expect(reload).rejects.toThrow(/network lost|disconnected|closed/i);
+
+  // Reconnecting must not resend the lost reload: only the caller decides to reload again.
+  const reconnecting = client.connect();
+  mock.triggerOpen();
+  await reconnecting;
+  expect(mock.sent).toEqual([]);
 });
 
 test("keeps waitForAgentUpsert initial fetch inside the requested deadline", async () => {
