@@ -2266,6 +2266,11 @@ remove Command Center items and clear the installation's query state. An already
 remains as unavailable until its matching contribution returns or the user closes it. Panel render
 failures stay inside the plugin error boundary.
 
+Reload queues behind the daemon's other plugin work, such as a running installation or preparation
+command, and the daemon answers when the plugin is running again or has failed. Nothing reads the
+plugin's status as the reload's outcome: `plugin ls`, Settings, and the logs stay readable while it
+runs and show the plugin's previous state until it finishes.
+
 ## Plugin sources
 
 Paste one of these source identifiers into **Settings → Plugins**, or pass it to
