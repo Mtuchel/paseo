@@ -2268,8 +2268,9 @@ failures stay inside the plugin error boundary.
 
 Reload queues behind the daemon's other plugin work, such as a running installation or preparation
 command, and the daemon answers when the plugin is running again or has failed. Nothing reads the
-plugin's status as the reload's outcome: `plugin ls`, Settings, and the logs stay readable while it
-runs and show the plugin's previous state until it finishes.
+plugin's status as the reload's outcome: while the reload is queued, `plugin ls`, Settings, and the
+logs show the plugin's previous state, and while the daemon stops and starts it, a status read
+reports `failed` because the plugin is absent from the runtime catalog until its start completes.
 
 ## Plugin sources
 

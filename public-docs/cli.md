@@ -184,9 +184,13 @@ paseo plugin remove my-plugin
 ```
 
 `paseo plugin reload <id>` reports the result of the reload itself: it waits while the daemon stops
-and starts the plugin, however long that takes. Cancelling the command or losing the connection does
-not stop the daemon's work, so check `paseo plugin ls <id>` before reloading again. The listing shows
-the plugin's previous state until the reload finishes.
+and starts the plugin, however long that takes, and it queues behind the daemon's other plugin work.
+Cancelling the command or losing the connection does not stop the daemon's work. No listing or log
+entry settles what happened to a cancelled reload: while the reload is queued, `paseo plugin ls <id>`
+keeps showing the previous state, and while the daemon stops and starts the plugin, the listing reads
+`failed` because the plugin is absent from the runtime catalog until its start completes. Running the
+reload again is what reports the result: it waits behind the outstanding one, then stops and starts
+the plugin once more.
 
 GitHub shorthand checks an existing host directory first. Append `:<directory>` for a plugin in a
 monorepo. `paseo plugin ls [id]` does not contact the remote. `paseo plugin logs <id>` returns the
