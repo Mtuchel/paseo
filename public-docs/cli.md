@@ -183,6 +183,11 @@ paseo plugin enable my-plugin
 paseo plugin remove my-plugin
 ```
 
+`paseo plugin reload <id>` reports the result of the reload itself: it waits while the daemon stops
+and starts the plugin, however long that takes. Cancelling the command or losing the connection does
+not stop the daemon's work, so check `paseo plugin ls <id>` before reloading again. The listing shows
+the plugin's previous state until the reload finishes.
+
 GitHub shorthand checks an existing host directory first. Append `:<directory>` for a plugin in a
 monorepo. `paseo plugin ls [id]` does not contact the remote. `paseo plugin logs <id>` returns the
 plugin's recent daemon-side stdout and stderr. Add `--json` for structured entries, or run
