@@ -1,3 +1,4 @@
+import { existsSync } from "node:fs";
 import overviewCorpus from "../../../protocol/tests/fixtures/plugin-overview.json";
 import { pluginRequirements } from "../support/helpers/plugin-fixture";
 import { execFileSync } from "node:child_process";
@@ -314,6 +315,47 @@ export default function contribute(plugin) {
 }`,
   );
   return directory;
+}
+
+/** Build command that holds the plugin lifecycle queue until the test writes the release file. */
+const gatedBuildCommand = [
+  'const fs = require("node:fs");',
+  'fs.writeFileSync(process.argv[1], "started");',
+  "const wait = () => {",
+  "  if (fs.existsSync(process.argv[2])) return;",
+  "  setTimeout(wait, 50);",
+  "};",
+  "wait();",
+].join("\n");
+
+async function createGatedBuildRepository(
+  root: string,
+  gate: { started: string; release: string },
+): Promise<string> {
+  const repository = path.join(root, "gated-repository");
+  await mkdir(repository);
+  await writeFile(
+    path.join(repository, "paseo-plugin.json"),
+    JSON.stringify({
+      id: "gated-build-plugin",
+      description: "Holds the plugin lifecycle queue while its build waits",
+      requirements: pluginRequirements,
+      build: [[process.execPath, "-e", gatedBuildCommand, gate.started, gate.release]],
+    }),
+  );
+  await writeFile(path.join(repository, "index.client.tsx"), pluginSource("Gated build plugin"));
+  execFileSync("git", ["init", "-b", "main"], { cwd: repository, stdio: "ignore" });
+  execFileSync("git", ["config", "user.name", "Paseo Tests"], {
+    cwd: repository,
+    stdio: "ignore",
+  });
+  execFileSync("git", ["config", "user.email", "paseo@example.test"], {
+    cwd: repository,
+    stdio: "ignore",
+  });
+  execFileSync("git", ["add", "-A"], { cwd: repository, stdio: "ignore" });
+  execFileSync("git", ["commit", "-m", "initial"], { cwd: repository, stdio: "ignore" });
+  return repository;
 }
 
 async function installFailedPlugin(
@@ -680,3 +722,105 @@ async function installPluginWithUntrustedDescription(
   );
   await environment.client.installPluginSource({ source: directory });
 }
+
+test("keeps Reload pending past a minute while the plugin queue is busy", async ({
+  page,
+  pluginEnvironment,
+}, testInfo) => {
+  // The wait under test is the daemon's own lifecycle queue, so the scenario runs on real time.
+  test.setTimeout(180_000);
+  const { client, directory } = pluginEnvironment;
+  const pluginDirectory = await createDirectoryPlugin(
+    directory,
+    "e2e-plugin",
+    "Exercises the complete local plugin lifecycle",
+    "Plugin v1",
+  );
+
+  const reloadRequests: number[] = [];
+  const reloadResponses: number[] = [];
+  page.on("websocket", (socket) => {
+    // The reload request travels client -> daemon, so it is an outbound frame; the answer back is
+    // inbound.
+    socket.on("framesent", ({ payload }) => {
+      if (typeof payload !== "string") return;
+      try {
+        const envelope = JSON.parse(payload) as { type?: unknown; message?: { type?: unknown } };
+        const message = envelope.type === "session" ? envelope.message : envelope;
+        if (message?.type === "plugin.reload.request") reloadRequests.push(Date.now());
+      } catch {
+        return;
+      }
+    });
+    socket.on("framereceived", ({ payload }) => {
+      if (typeof payload !== "string") return;
+      try {
+        const envelope = JSON.parse(payload) as { type?: unknown; message?: { type?: unknown } };
+        const message = envelope.type === "session" ? envelope.message : envelope;
+        if (message?.type === "plugin.reload.response") reloadResponses.push(Date.now());
+      } catch {
+        return;
+      }
+    });
+  });
+
+  await gotoAppShell(page);
+  await openPluginSettings(page);
+  // Plugins on is a precondition here, not the subject: set it through the daemon instead of the
+  // switch, whose transient "Plugins enabled" confirmation this scenario must not depend on.
+  await client.patchDaemonConfig({ pluginsEnabled: true });
+  await client.installPluginSource({ source: pluginDirectory });
+  await expect(page.getByLabel("e2e-plugin running")).toBeVisible();
+
+  // A gated build holds the daemon's plugin lifecycle queue open until the test releases it.
+  const gate = {
+    started: path.join(directory, "build-started"),
+    release: path.join(directory, "build-release"),
+  };
+  const repository = await createGatedBuildRepository(directory, gate);
+  const queuedInstall = client.installPluginSource({
+    source: `git:${pathToFileURL(repository).href}`,
+  });
+  await expect.poll(() => existsSync(gate.started), { timeout: 30_000 }).toBe(true);
+
+  const actionsButton = page.getByRole("button", { name: "Actions for e2e-plugin", exact: true });
+  await selectPluginAction(page, "e2e-plugin", "Reload");
+  await expect.poll(() => reloadRequests.length, { timeout: 30_000 }).toBe(1);
+  // Pending: the row's actions stay disabled, so a second reload cannot be submitted.
+  await expect(actionsButton).toBeDisabled();
+  await page.screenshot({
+    path: testInfo.outputPath("plugin-reload-pending.png"),
+    fullPage: true,
+    animations: "disabled",
+  });
+
+  const requestedAt = reloadRequests[0]!;
+  const remaining = 66_000 - (Date.now() - requestedAt);
+  if (remaining > 0) await page.waitForTimeout(remaining);
+
+  // Past the former deadline the reload is still pending, the row shows its previous state, and
+  // no timeout error reached the surface.
+  await expect(actionsButton).toBeDisabled();
+  await expect(page.getByLabel("e2e-plugin running")).toBeVisible();
+  await expect(page.getByTestId("plugin-management-feedback")).toHaveCount(0);
+  await page.screenshot({
+    path: testInfo.outputPath("plugin-reload-past-deadline.png"),
+    fullPage: true,
+    animations: "disabled",
+  });
+
+  await writeFile(gate.release, "go");
+  // The daemon's answer only arrives once the plugin really started again. It carries the result
+  // the row waited for; a request timeout would have shown up as feedback during the wait above.
+  await expect.poll(() => reloadResponses.length, { timeout: 120_000 }).toBe(1);
+  expect(reloadRequests.length).toBe(1);
+  await expect(page.getByTestId("plugin-management-feedback")).toContainText("Reloaded e2e-plugin");
+  await page.screenshot({
+    path: testInfo.outputPath("plugin-reload-completed.png"),
+    fullPage: true,
+    animations: "disabled",
+  });
+
+  await queuedInstall;
+  await client.removePlugin("gated-build-plugin");
+});
