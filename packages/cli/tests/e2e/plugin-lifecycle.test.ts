@@ -340,6 +340,8 @@ async function main(): Promise<void> {
     const targetDirectory = path.join(gateDirectory, "slow-reload-target");
     const slowRepository = path.join(gateDirectory, "slow-build");
     const reloadObserver = await startRequestObserver(context.port);
+    let slowInstall: ReturnType<typeof context.paseo> | undefined;
+    let slowReload: ReturnType<typeof context.paseo> | undefined;
     try {
       await mkdir(targetDirectory);
       await writeFile(
@@ -374,7 +376,7 @@ async function main(): Promise<void> {
       await git(slowRepository, ["commit", "-m", "blocking build"]);
 
       // This install holds the plugin lifecycle queue while its build waits for the gate.
-      const slowInstall = context.paseo(
+      slowInstall = context.paseo(
         ["plugin", "add", `git:${pathToFileURL(slowRepository).href}`, "--json"],
         { timeout: 180_000 },
       );
@@ -387,7 +389,7 @@ async function main(): Promise<void> {
         "the blocking build to start",
       );
 
-      const slowReload = context.paseo(
+      slowReload = context.paseo(
         [
           "plugin",
           "reload",
@@ -444,8 +446,10 @@ async function main(): Promise<void> {
         assert.equal(removed.exitCode, 0, removed.stderr);
       }
     } finally {
-      // Releasing the gate and closing the observer keeps a failed assertion from hanging the run.
+      // Release the gate, then let the install and the reload settle before their files go: the
+      // build polls for the gate file, so cleanup must not delete it while the child still waits.
       await writeFile(buildGate, "go").catch(() => undefined);
+      await Promise.all([slowInstall?.catch(() => undefined), slowReload?.catch(() => undefined)]);
       await reloadObserver.close();
       await rm(gateDirectory, { recursive: true, force: true });
     }
