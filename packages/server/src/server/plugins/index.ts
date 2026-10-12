@@ -71,6 +71,8 @@ export class PluginService {
   private readonly providerIdsByPlugin = new Map<string, readonly string[]>();
   private readonly providerListeners = new Set<() => void>();
   private lifecycle = Promise.resolve();
+  private readonly flights = new Map<string, Promise<void>>();
+  private readonly loading = new Set<string>();
   private globalStartsBlocked = true;
   private started = false;
   private readonly settingsListeners = new Set<(pluginId: string, settingsId: string) => void>();
@@ -141,7 +143,6 @@ export class PluginService {
       for (const [pluginId, source] of Object.entries(config.plugins ?? {})) {
         if (source.enabled === false) continue;
         await this.startConfigured(pluginId);
-        this.notify(pluginId);
       }
     }
     this.configStore.onFieldChange("pluginsEnabled", (value) => {
@@ -165,6 +166,7 @@ export class PluginService {
             running: running.has(id),
           }),
         };
+        if (this.loading.has(id)) item.loading = true;
         const manifest = await readPluginManifest(path.resolve(source.path)).catch(() => null);
         if (manifest?.description) item.description = manifest.description;
         item.installation = await this.managedSources
@@ -210,10 +212,14 @@ export class PluginService {
         [pluginId]: { source: "directory" as const, path: directory, enabled: true },
       };
       this.configStore.patch({ plugins: sources });
-      if (this.canPublish(pluginId)) await this.startConfigured(pluginId);
-      this.notify(pluginId);
+      const starting = this.canPublish(pluginId);
+      if (starting) await this.startConfigured(pluginId);
+      // A configured start announces its own loading and settled transitions; an install that cannot
+      // start yet still announces the new row.
+      if (!starting) this.notify(pluginId);
       const installed = await this.requireItem(pluginId);
-      if (installed.status === "failed") {
+      // An overlapping reload or enable for the same plugin owns its start; the install itself succeeded.
+      if (installed.status === "failed" && installed.loading !== true) {
         throw new Error(installed.error ?? `Plugin failed to start: ${pluginId}`);
       }
       return installed;
@@ -353,31 +359,27 @@ export class PluginService {
   }
 
   async reloadPlugin(pluginId: string): Promise<PluginListItem> {
-    return this.enqueue(async () => {
+    await this.runPluginOperation(pluginId, { queued: true }, async () => {
       const source = this.requireEnabledSource(pluginId);
       if (this.configStore.get().pluginsEnabled !== true) {
         throw new Error("Plugins are globally disabled");
       }
-      this.errors.delete(pluginId);
       await this.stopPlugin(pluginId);
       await this.startExplicit(pluginId, source.path);
-      this.notify(pluginId);
-      return this.requireItem(pluginId);
     });
+    return this.requireItem(pluginId);
   }
 
   async enablePlugin(pluginId: string): Promise<PluginListItem> {
     const source = this.requireSource(pluginId);
     this.patchSource(pluginId, { ...source, enabled: true });
-    this.errors.delete(pluginId);
-    return this.enqueue(async () => {
+    await this.runPluginOperation(pluginId, { queued: true }, async () => {
       const current = this.requireSource(pluginId);
       if (current.enabled !== false && this.configStore.get().pluginsEnabled === true) {
         await this.startExplicit(pluginId, current.path);
       }
-      this.notify(pluginId);
-      return this.requireItem(pluginId);
     });
+    return this.requireItem(pluginId);
   }
 
   async disablePlugin(pluginId: string): Promise<PluginListItem> {
@@ -438,8 +440,8 @@ export class PluginService {
     void this.enqueue(async () => {
       this.globalStartsBlocked = false;
       for (const [pluginId, source] of Object.entries(this.configStore.get().plugins ?? {})) {
-        if (source.enabled !== false) await this.startConfigured(pluginId);
-        this.notify(pluginId);
+        if (source.enabled === false) continue;
+        await this.startConfigured(pluginId);
       }
     }).catch((error) => this.logger.error({ err: error }, "Failed to enable plugins"));
   }
@@ -447,12 +449,45 @@ export class PluginService {
   private async startConfigured(pluginId: string): Promise<void> {
     const source = this.configStore.get().plugins?.[pluginId];
     if (!source || source.enabled === false || !this.canPublish(pluginId)) return;
-    this.errors.delete(pluginId);
+    if (this.flights.has(pluginId)) return;
     try {
-      await this.startPlugin(pluginId, source.path);
+      await this.runPluginOperation(pluginId, { queued: false }, () =>
+        this.startPlugin(pluginId, source.path),
+      );
     } catch (error) {
       if (this.canPublish(pluginId)) this.recordFailure(pluginId, error);
     }
+  }
+
+  /**
+   * Single-flight per plugin: a reload, enable, or configured start that is already in flight owns
+   * the plugin, and overlapping requests share it instead of queueing a second stop and start.
+   * `loading` stays set from the request until the operation settles, so clients never read the
+   * "failed" a stop leaves behind. The entry is dropped inside the queue slot, so a request after
+   * the settle starts a fresh operation rather than joining the finished one, and failures clear it.
+   */
+  private runPluginOperation(
+    pluginId: string,
+    options: { queued: boolean },
+    run: () => Promise<void>,
+  ): Promise<void> {
+    const inFlight = this.flights.get(pluginId);
+    if (inFlight) return inFlight;
+    this.loading.add(pluginId);
+    this.errors.delete(pluginId);
+    this.notify(pluginId);
+    const body = async (): Promise<void> => {
+      try {
+        await run();
+      } finally {
+        this.loading.delete(pluginId);
+        this.flights.delete(pluginId);
+        this.notify(pluginId);
+      }
+    };
+    const flight = options.queued ? this.enqueue(body) : body();
+    this.flights.set(pluginId, flight);
+    return flight;
   }
 
   private async startExplicit(pluginId: string, sourcePath: string): Promise<void> {
@@ -488,6 +523,13 @@ export class PluginService {
         await this.runtime.stopPluginById(pluginId);
       }
       throw error;
+    }
+    // Provider publishing awaits icon reads, so a disable, remove, or global switch can land after
+    // the runtime's own gate. Re-check before reporting the start as published.
+    if (!this.canPublish(pluginId)) {
+      this.removeProviderRegistrations(pluginId);
+      await this.runtime.stopPluginById(pluginId);
+      throw new Error(`Plugin start cancelled: ${pluginId}`);
     }
   }
 

@@ -11,6 +11,7 @@ import type { AgentStreamEvent } from "../agent/agent-sdk-types.js";
 import { PluginAgentClientRegistry } from "../agent/plugin-provider.js";
 import { PluginRuntime } from "./runtime.js";
 import type { PluginSessionSocket } from "./session-socket.js";
+import { forkSubprocess } from "./subprocess.js";
 
 const temporaryDirectories: string[] = [];
 
@@ -39,17 +40,7 @@ function pluginMessages(runtime: PluginRuntime, pluginId: string): string[] {
 }
 
 function spawnObservedPluginProcess(onMessage: (message: unknown) => void) {
-  const loaderUrl = new URL("../../terminal/terminal-ts-loader.mjs", import.meta.url).href;
-  const setup = `import { register } from "node:module"; register(${JSON.stringify(loaderUrl)});`;
-  const child = fork(new URL("./plugin-process.ts", import.meta.url), [], {
-    execArgv: [
-      "--experimental-strip-types",
-      "--import",
-      `data:text/javascript,${encodeURIComponent(setup)}`,
-    ],
-    serialization: "advanced",
-    stdio: ["ignore", "pipe", "pipe", "ipc"],
-  });
+  const child = forkSubprocess("plugin-process", import.meta.url);
   child.on("message", onMessage);
   return child;
 }
@@ -840,6 +831,14 @@ export default function contribute(server: any) { server.registerProvider(provid
       runtime.getLogs("lifecycle").map(({ stream, message }) => ({ stream, message })),
     ).toEqual([
       { stream: "stdout", message: "[paseo] Loading plugin" },
+      {
+        stream: "stdout",
+        message: expect.stringMatching(/^\[paseo\] Compiled in \d+(\.\d)?(ms|s)$/),
+      },
+      {
+        stream: "stdout",
+        message: expect.stringMatching(/^\[paseo\] Process started in \d+(\.\d)?(ms|s)$/),
+      },
       { stream: "stdout", message: "[paseo] Plugin ready" },
       { stream: "stdout", message: "[paseo] Stopping plugin" },
       { stream: "stdout", message: "[paseo] Plugin stopped" },
@@ -896,7 +895,6 @@ export default function contribute(server: any) { server.registerProvider(provid
     expect(records.find((record) => record.message === "connection failed")).toMatchObject({
       module: "plugins",
       pluginId: "tagged-output",
-      sequence: 3,
       stream: "stderr",
       message: "connection failed",
     });

@@ -5466,12 +5466,12 @@ export class DaemonClient {
     });
   }
 
-  async reloadPlugin(pluginId: string): Promise<PluginListItem> {
-    return this.managePlugin("reload", pluginId);
+  async reloadPlugin(pluginId: string, timeout?: number): Promise<PluginListItem> {
+    return this.managePlugin("reload", pluginId, timeout);
   }
 
-  async enablePlugin(pluginId: string): Promise<PluginListItem> {
-    return this.managePlugin("enable", pluginId);
+  async enablePlugin(pluginId: string, timeout?: number): Promise<PluginListItem> {
+    return this.managePlugin("enable", pluginId, timeout);
   }
 
   async disablePlugin(pluginId: string): Promise<PluginListItem> {
@@ -5490,12 +5490,14 @@ export class DaemonClient {
   private async managePlugin(
     action: "reload" | "enable" | "disable",
     pluginId: string,
+    timeout?: number,
   ): Promise<PluginListItem> {
     const requestId = this.createRequestId();
     const payload = await this.sendCorrelatedSessionRequest({
       requestId,
       message: { type: `plugin.${action}.request`, requestId, pluginId },
       responseType: `plugin.${action}.response`,
+      timeout,
     });
     return payload.plugin;
   }

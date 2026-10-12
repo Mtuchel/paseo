@@ -6554,6 +6554,9 @@ export const PluginListItemSchema = z.object({
   path: z.string(),
   enabled: z.boolean(),
   status: PluginStatusSchema,
+  // True from the moment a start or reload is requested until it settles, so clients can show loading instead of the
+  // status a stop leaves behind. Older clients ignore it and keep reading `status`.
+  loading: z.boolean().optional(),
   source: z.enum(["directory", "git"]).optional(),
   npm: PluginNpmInstallationSchema.optional(),
   installation: PluginInstallationSchema.optional(),

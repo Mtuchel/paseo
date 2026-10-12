@@ -1,9 +1,7 @@
 import type { PluginBeforeRequests, PluginLifecycleEvents } from "@getpaseo/plugin/server";
 import { validateBeforeRequest, validateBeforeResult } from "./lifecycle/index.js";
-import { fork } from "node:child_process";
 import { stat } from "node:fs/promises";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
 import { randomUUID } from "node:crypto";
 import type pino from "pino";
 import {
@@ -16,7 +14,7 @@ import {
   type ProviderInput,
 } from "@getpaseo/plugin/server/provider";
 import type { PluginLogEntry } from "@getpaseo/protocol/messages";
-import { compilePlugin } from "./compiler.js";
+import { compilePluginIsolated } from "./compiler-isolation.js";
 import { readPluginManifest } from "./manifest.js";
 import type { PluginRequirements } from "@getpaseo/protocol/messages";
 import { assertPluginCompatibility } from "@getpaseo/protocol/plugin-requirements";
@@ -27,6 +25,7 @@ import type {
 } from "./plugin-process-protocol.js";
 import { PluginProcessMessageSchema } from "./plugin-process-protocol.js";
 import { PluginSessionSocket } from "./session-socket.js";
+import { forkSubprocess, terminateSubprocess } from "./subprocess.js";
 
 const CLIENT_ENTRY_FILENAMES = ["index.client.ts", "index.client.tsx"] as const;
 const SERVER_ENTRY_FILENAMES = ["index.server.ts", "index.server.tsx"] as const;
@@ -198,43 +197,17 @@ export interface PluginPaseoSessionHost {
   ): Promise<{ closed: Promise<void> }>;
 }
 
-function resolveWorkerUrl(): URL {
-  return new URL(
-    import.meta.url.endsWith(".ts") ? "./plugin-process.ts" : "./plugin-process.js",
-    import.meta.url,
-  );
-}
-
-function resolveWorkerExecArgv(): string[] {
-  if (!import.meta.url.endsWith(".ts")) return [];
-  const loaderUrl = new URL("../../terminal/terminal-ts-loader.mjs", import.meta.url).href;
-  const importSource = [
-    'import { register } from "node:module";',
-    'import { pathToFileURL } from "node:url";',
-    `register(${JSON.stringify(loaderUrl)}, pathToFileURL("./"));`,
-  ].join(" ");
-  return [
-    "--experimental-strip-types",
-    "--import",
-    `data:text/javascript,${encodeURIComponent(importSource)}`,
-  ];
-}
-
 function spawnPluginChild(): PluginChild {
-  return fork(fileURLToPath(resolveWorkerUrl()), [], {
-    execArgv: resolveWorkerExecArgv(),
-    serialization: "advanced",
-    stdio: ["ignore", "pipe", "pipe", "ipc"],
-  }) as PluginChild;
-}
-
-function terminatePluginChild(child: PluginChild): void {
-  if (child.connected) child.disconnect();
-  if (!child.killed) child.kill();
+  return forkSubprocess("plugin-process", import.meta.url) as PluginChild;
 }
 
 function describeError(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function formatElapsed(stageAt: number): string {
+  const elapsed = performance.now() - stageAt;
+  return elapsed >= 10_000 ? `${(elapsed / 1000).toFixed(1)}s` : `${Math.round(elapsed)}ms`;
 }
 
 function jsonTransportValue<Value>(value: Value): Value {
@@ -337,7 +310,7 @@ export class PluginRuntime {
     const manifest = await readPluginManifest(directory);
     assertPluginCompatibility({ ...manifest, version: this.daemonVersion, runtime: "daemon" });
     const entryPaths = await resolveEntryPaths(directory);
-    await compilePlugin(entryPaths);
+    await compilePluginIsolated(entryPaths);
   }
 
   async stopPluginById(pluginId: string): Promise<boolean> {
@@ -553,10 +526,13 @@ export class PluginRuntime {
     configuredPath: string,
   ): Promise<LoadedPlugin> {
     const directory = path.resolve(configuredPath);
+    let stageAt = performance.now();
     const manifest = await readPluginManifest(directory);
     assertPluginCompatibility({ ...manifest, version: this.daemonVersion, runtime: "daemon" });
     const entryPaths = await resolveEntryPaths(directory);
-    const bundles = await compilePlugin(entryPaths);
+    const bundles = await compilePluginIsolated(entryPaths);
+    this.appendLog(pluginId, "stdout", `[paseo] Compiled in ${formatElapsed(stageAt)}`);
+    stageAt = performance.now();
     const serverBundle = bundles.serverBundle;
     if (!serverBundle) {
       return {
@@ -590,7 +566,7 @@ export class PluginRuntime {
     const sessionAttachment = await sessionHost
       .attachPluginSocket(pluginId, session.socket)
       .catch((error) => {
-        terminatePluginChild(child);
+        terminateSubprocess(child);
         throw error;
       });
     let loaded: LoadedPlugin | null = null;
@@ -664,9 +640,10 @@ export class PluginRuntime {
     } catch (error) {
       session.socket.close();
       await sessionAttachment.closed;
-      terminatePluginChild(child);
+      terminateSubprocess(child);
       throw error;
     }
+    this.appendLog(pluginId, "stdout", `[paseo] Process started in ${formatElapsed(stageAt)}`);
     loaded = {
       id: pluginId,
       clientBundle: bundles.clientBundle ?? "",
@@ -1033,7 +1010,7 @@ export class PluginRuntime {
     const state = connectionId ? loaded.providerConnections.get(connectionId) : undefined;
     if (!connectionId || !state) {
       this.appendLog(loaded.id, "stderr", `[paseo] ${error.message}`);
-      terminatePluginChild(loaded.child!);
+      terminateSubprocess(loaded.child!);
       return;
     }
     this.failProviderConnection(loaded, connectionId, state, error);

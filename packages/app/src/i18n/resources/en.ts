@@ -2100,7 +2100,7 @@ export const en = {
         errorTitle: "Unable to load plugin logs",
         empty: "No plugin output yet",
       },
-      status: { running: "running", disabled: "disabled", failed: "failed" },
+      status: { running: "running", disabled: "disabled", failed: "failed", loading: "loading" },
       actions: {
         menu: "Actions for {{id}}",
         reload: "Reload",
@@ -2119,6 +2119,7 @@ export const en = {
         disable: "Disabled {{id}}",
         remove: "Removed {{id}}",
         kept: "Kept {{id}}",
+        stillLoading: "{{id}} is still loading",
         globalEnabled: "Plugins enabled",
         globalDisabled: "Plugins disabled",
       },

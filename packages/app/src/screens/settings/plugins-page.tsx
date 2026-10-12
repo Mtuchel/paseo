@@ -5,6 +5,7 @@ import { useTranslation } from "react-i18next";
 import { Text, View } from "react-native";
 import { StyleSheet } from "react-native-unistyles";
 import { useMutation } from "@tanstack/react-query";
+import { DaemonConnectionError } from "@getpaseo/client/internal/daemon-client";
 import type { PluginListItem, PluginLogEntry } from "@getpaseo/protocol/messages";
 import { MoreHorizontal, Trash2 } from "lucide-react-native";
 import { AdaptiveModalSheet, type SheetHeader } from "@/components/adaptive-modal-sheet";
@@ -136,7 +137,9 @@ function PluginRow({
     (enabled: boolean) => onAction(enabled ? "enable" : "disable", plugin),
     [onAction, plugin],
   );
-  const status = clientError ? "failed" : plugin.status;
+  let status: PluginListItem["status"] | "loading" = plugin.status;
+  if (plugin.loading === true && plugin.status !== "disabled") status = "loading";
+  if (clientError) status = "failed";
   let badgeVariant: "success" | "error" | "muted" = "muted";
   if (status === "running") badgeVariant = "success";
   else if (status === "failed") badgeVariant = "error";
@@ -374,7 +377,17 @@ export function HostPluginsPage({ serverId }: { serverId: string }) {
           if (!confirmed) return t("settings.plugins.feedback.kept", { id: plugin.id });
           await client.removePlugin(plugin.id);
         } else {
-          await client[`${name}Plugin`](plugin.id);
+          try {
+            await client[`${name}Plugin`](plugin.id);
+          } catch (error) {
+            // A reload or enable compiles and starts the plugin, which can outlast the request
+            // timeout. The daemon keeps loading and reports the outcome through the catalog, so a
+            // timed-out start is neither finished nor failed.
+            const timedOut =
+              error instanceof DaemonConnectionError && error.code === "DAEMON_REQUEST_TIMEOUT";
+            if (name === "disable" || !timedOut) throw error;
+            return t("settings.plugins.feedback.stillLoading", { id: plugin.id });
+          }
         }
         return t(`settings.plugins.feedback.${name}`, { id: plugin.id });
       };

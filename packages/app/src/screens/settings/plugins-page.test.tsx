@@ -1,12 +1,12 @@
-import { subscriptionFixture } from "@/runtime/subscription-fixture";
 /**
  * @vitest-environment jsdom
  */
+import { subscriptionFixture } from "@/runtime/subscription-fixture";
 import { i18n as testI18n } from "@/i18n/i18next";
 import React, { type ReactElement } from "react";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import type { DaemonClient } from "@getpaseo/client/internal/daemon-client";
+import { DaemonConnectionError, type DaemonClient } from "@getpaseo/client/internal/daemon-client";
 import type { PluginListItem, PluginLogEntry } from "@getpaseo/protocol/messages";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { HostPluginsPage } from "./plugins-page";
@@ -204,6 +204,34 @@ describe("HostPluginsPage", () => {
     await screen.findByText("example");
     fireEvent.click(screen.getByRole("button", { name: "Actions for example" }));
     expect(screen.queryByRole("menuitem", { name: "Logs" })).toBeNull();
+  });
+
+  it("shows loading for a plugin whose start is in flight", async () => {
+    const client = createClient();
+    client.listPlugins.mockResolvedValue([
+      { ...plugin(), status: "failed" as const, loading: true },
+    ]);
+    renderPage(client);
+
+    expect(await screen.findByText("loading")).toBeDefined();
+  });
+
+  it("treats a timed-out reload as still loading instead of a failure", async () => {
+    const client = createClient();
+    client.listPlugins.mockResolvedValue([plugin()]);
+    client.reloadPlugin.mockRejectedValue(
+      new DaemonConnectionError("Timeout waiting for message (60000ms)", "DAEMON_REQUEST_TIMEOUT"),
+    );
+    renderPage(client);
+
+    await selectPluginAction("Reload");
+
+    await waitFor(() =>
+      expect(screen.getByTestId("plugin-management-feedback").textContent).toContain(
+        "example is still loading",
+      ),
+    );
+    expect(screen.queryByText("Timeout waiting for message (60000ms)")).toBeNull();
   });
 
   it("opens readable stdout and stderr logs and refreshes them", async () => {

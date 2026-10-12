@@ -82,13 +82,6 @@ function bindTestSessionHost(service: PluginService): PluginService {
   return service;
 }
 
-function catalogIds(service: PluginService): string[] {
-  return service
-    .catalog()
-    .map(({ id }) => id)
-    .sort();
-}
-
 afterEach(async () => {
   await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
 });
@@ -157,6 +150,67 @@ function createPluginSelectivePausedRuntime(pausedPluginId: string) {
     bindPaseoSessionHost: () => undefined,
   };
   return { runtime, started, releaseStart, starts };
+}
+
+/** Counts every start and gates it until the test releases it, so overlapping requests stay observable. */
+function createGatedRuntime() {
+  const gates: Array<() => void> = [];
+  const starts: string[] = [];
+  const running = new Set<string>();
+  const startedWaiters: Array<{ count: number; resolve: () => void }> = [];
+  const runningWaiters: Array<{ count: number; resolve: () => void }> = [];
+  const failures: { next?: Error } = {};
+  const notifyWaiters = (waiters: Array<{ count: number; resolve: () => void }>, count: number) => {
+    for (let index = 0; index < waiters.length; ) {
+      const waiter = waiters[index];
+      if (count < waiter.count) {
+        index++;
+        continue;
+      }
+      waiters.splice(index, 1);
+      waiter.resolve();
+    }
+  };
+  const runtime: TestPluginRuntime = {
+    catalog: () => [...running].map((id) => ({ id, clientBundle: "bundle" })),
+    invoke: async () => undefined,
+    getLogs: () => [],
+    clearLogs: () => undefined,
+    startPlugin: async (pluginId, _path, canPublish) => {
+      starts.push(pluginId);
+      notifyWaiters(startedWaiters, starts.length);
+      await new Promise<void>((resolve) => gates.push(resolve));
+      if (!canPublish()) throw new Error(`Plugin start cancelled: ${pluginId}`);
+      const failure = failures.next;
+      failures.next = undefined;
+      if (failure) throw failure;
+      running.add(pluginId);
+      notifyWaiters(runningWaiters, running.size);
+    },
+    stopPluginById: async (pluginId) => running.delete(pluginId),
+    stopAll: async () => {
+      running.clear();
+    },
+    subscribe: () => () => undefined,
+    bindPaseoSessionHost: () => undefined,
+  };
+  return {
+    runtime,
+    starts,
+    failures,
+    whenStarted: (count: number) =>
+      starts.length >= count
+        ? Promise.resolve()
+        : new Promise<void>((resolve) => startedWaiters.push({ count, resolve })),
+    whenRunning: (count: number) =>
+      running.size >= count
+        ? Promise.resolve()
+        : new Promise<void>((resolve) => runningWaiters.push({ count, resolve })),
+    release: () => gates.shift()?.(),
+    releaseAll: () => {
+      while (gates.length > 0) gates.shift()?.();
+    },
+  };
 }
 
 describe("PluginService", () => {
@@ -264,7 +318,7 @@ describe("PluginService", () => {
     expect(entries).toEqual([]);
   });
 
-  it("publishes each configured plugin after its startup state settles", async () => {
+  it("announces each configured plugin as loading before its startup state settles", async () => {
     const home = await mkdtemp(path.join(tmpdir(), "paseo-plugin-home-"));
     roots.push(home);
     const first = await createPlugin(
@@ -279,12 +333,38 @@ describe("PluginService", () => {
       "startup-first": { source: "directory", path: first },
       "startup-second": { source: "directory", path: second },
     });
-    const snapshots: string[][] = [];
-    service.subscribe(() => snapshots.push(catalogIds(service)));
+    const announcements: Array<Promise<Array<{ id: string; status: string; loading?: boolean }>>> =
+      [];
+    service.subscribe(() => {
+      announcements.push(service.listPlugins());
+    });
 
     await service.start();
 
-    expect(snapshots).toEqual([["startup-first"], ["startup-first", "startup-second"]]);
+    const snapshots = [];
+    for (const plugins of await Promise.all(announcements)) {
+      const states = [];
+      for (const { id, status, loading } of plugins) states.push({ id, status, loading });
+      snapshots.push(states);
+    }
+    expect(snapshots).toEqual([
+      [
+        { id: "startup-first", status: "failed", loading: true },
+        { id: "startup-second", status: "failed", loading: undefined },
+      ],
+      [
+        { id: "startup-first", status: "running", loading: undefined },
+        { id: "startup-second", status: "failed", loading: undefined },
+      ],
+      [
+        { id: "startup-first", status: "running", loading: undefined },
+        { id: "startup-second", status: "failed", loading: true },
+      ],
+      [
+        { id: "startup-first", status: "running", loading: undefined },
+        { id: "startup-second", status: "running", loading: undefined },
+      ],
+    ]);
     await service.stopAllPlugins();
   }, 20_000);
 
@@ -968,7 +1048,258 @@ export default function contribute(plugin: unknown) {
     expect(service.catalog()).toEqual([{ id: "occupier", clientBundle: "bundle" }]);
   });
 
-  it("notifies exactly once after successful and failed configured installs", async () => {
+  it("shares one reload between overlapping requests and reports loading until it settles", async () => {
+    const home = await mkdtemp(path.join(tmpdir(), "paseo-plugin-home-"));
+    roots.push(home);
+    const store = createStore(home, {
+      slow: { source: "directory", path: "/plugins/slow", enabled: true },
+    });
+    const gated = createGatedRuntime();
+    const service = new PluginService(pino({ level: "silent" }), store, "0.4.0", {
+      runtime: gated.runtime,
+    });
+    const starting = service.start();
+    await gated.whenStarted(1);
+    gated.release();
+    await starting;
+    expect(service.catalog()).toEqual([{ id: "slow", clientBundle: "bundle" }]);
+
+    const reloading = service.reloadPlugin("slow");
+    const enabling = service.enablePlugin("slow");
+    await expect(service.listPlugins()).resolves.toMatchObject([{ id: "slow", loading: true }]);
+    await gated.whenStarted(2);
+    await expect(service.listPlugins()).resolves.toMatchObject([
+      { id: "slow", status: "failed", loading: true },
+    ]);
+    gated.release();
+
+    await expect(Promise.all([reloading, enabling])).resolves.toEqual([
+      expect.objectContaining({ id: "slow", status: "running" }),
+      expect.objectContaining({ id: "slow", status: "running" }),
+    ]);
+    expect(gated.starts).toEqual(["slow", "slow"]);
+    expect(
+      (await service.listPlugins()).map(({ id, status, loading }) => ({ id, status, loading })),
+    ).toEqual([{ id: "slow", status: "running", loading: undefined }]);
+
+    const again = service.reloadPlugin("slow");
+    await gated.whenStarted(3);
+    gated.release();
+    await expect(again).resolves.toMatchObject({ id: "slow", status: "running" });
+    expect(gated.starts).toEqual(["slow", "slow", "slow"]);
+    await service.stopAllPlugins();
+  });
+
+  it("coalesces a reload into the start it overlaps", async () => {
+    const home = await mkdtemp(path.join(tmpdir(), "paseo-plugin-home-"));
+    roots.push(home);
+    const store = createStore(home, {
+      slow: { source: "directory", path: "/plugins/slow", enabled: true },
+    });
+    const gated = createGatedRuntime();
+    const service = new PluginService(pino({ level: "silent" }), store, "0.4.0", {
+      runtime: gated.runtime,
+    });
+
+    const starting = service.start();
+    await gated.whenStarted(1);
+    const reloading = service.reloadPlugin("slow");
+    await expect(service.listPlugins()).resolves.toMatchObject([{ id: "slow", loading: true }]);
+    gated.release();
+
+    await starting;
+    await expect(reloading).resolves.toMatchObject({ id: "slow", status: "running" });
+    expect(gated.starts).toEqual(["slow"]);
+    await service.stopAllPlugins();
+  });
+
+  it("keeps different plugins on their own operations while duplicates join", async () => {
+    const home = await mkdtemp(path.join(tmpdir(), "paseo-plugin-home-"));
+    roots.push(home);
+    const store = createStore(home, {
+      first: { source: "directory", path: "/plugins/first", enabled: true },
+      second: { source: "directory", path: "/plugins/second", enabled: true },
+    });
+    const gated = createGatedRuntime();
+    const service = new PluginService(pino({ level: "silent" }), store, "0.4.0", {
+      runtime: gated.runtime,
+    });
+    const starting = service.start();
+    await gated.whenStarted(1);
+    gated.release();
+    await gated.whenStarted(2);
+    gated.release();
+    await starting;
+    expect(gated.starts).toEqual(["first", "second"]);
+
+    const reloadFirst = service.reloadPlugin("first");
+    await gated.whenStarted(3);
+    const reloadSecond = service.reloadPlugin("second");
+    const duplicateFirst = service.reloadPlugin("first");
+    await expect(service.listPlugins()).resolves.toMatchObject([
+      { id: "first", loading: true },
+      { id: "second", loading: true },
+    ]);
+    gated.release();
+    await gated.whenStarted(4);
+    gated.release();
+
+    await expect(Promise.all([reloadFirst, reloadSecond, duplicateFirst])).resolves.toEqual([
+      expect.objectContaining({ id: "first", status: "running" }),
+      expect.objectContaining({ id: "second", status: "running" }),
+      expect.objectContaining({ id: "first", status: "running" }),
+    ]);
+    expect(gated.starts).toEqual(["first", "second", "first", "second"]);
+    await service.stopAllPlugins();
+  });
+
+  it("clears a failed reload so the next request starts a new operation", async () => {
+    const home = await mkdtemp(path.join(tmpdir(), "paseo-plugin-home-"));
+    roots.push(home);
+    const store = createStore(home, {
+      slow: { source: "directory", path: "/plugins/slow", enabled: true },
+    });
+    const gated = createGatedRuntime();
+    const service = new PluginService(pino({ level: "silent" }), store, "0.4.0", {
+      runtime: gated.runtime,
+    });
+    const starting = service.start();
+    await gated.whenStarted(1);
+    gated.release();
+    await starting;
+
+    gated.failures.next = new Error("compile exploded");
+    const failing = service.reloadPlugin("slow");
+    await gated.whenStarted(2);
+    gated.release();
+    await expect(failing).rejects.toThrow("compile exploded");
+    expect(
+      (await service.listPlugins()).map(({ id, status, loading, error }) => ({
+        id,
+        status,
+        loading,
+        error,
+      })),
+    ).toEqual([{ id: "slow", status: "failed", loading: undefined, error: "compile exploded" }]);
+
+    const retrying = service.reloadPlugin("slow");
+    await gated.whenStarted(3);
+    gated.release();
+    await expect(retrying).resolves.toMatchObject({ id: "slow", status: "running" });
+    expect(gated.starts).toEqual(["slow", "slow", "slow"]);
+    await service.stopAllPlugins();
+  });
+
+  it("sends an in-flight reload into disabled without leaving it loading", async () => {
+    const home = await mkdtemp(path.join(tmpdir(), "paseo-plugin-home-"));
+    roots.push(home);
+    const store = createStore(home, {
+      slow: { source: "directory", path: "/plugins/slow", enabled: true },
+    });
+    const gated = createGatedRuntime();
+    const service = new PluginService(pino({ level: "silent" }), store, "0.4.0", {
+      runtime: gated.runtime,
+    });
+    const starting = service.start();
+    await gated.whenStarted(1);
+    gated.release();
+    await starting;
+
+    const reloading = service.reloadPlugin("slow");
+    await gated.whenStarted(2);
+    const disabling = service.disablePlugin("slow");
+    gated.release();
+
+    await expect(reloading).rejects.toThrow("Plugin start cancelled: slow");
+    await expect(disabling).resolves.toMatchObject({ id: "slow", status: "disabled" });
+    expect(service.catalog()).toEqual([]);
+    expect(
+      (await service.listPlugins()).map(({ id, status, loading }) => ({ id, status, loading })),
+    ).toEqual([{ id: "slow", status: "disabled", loading: undefined }]);
+    await service.stopAllPlugins();
+  });
+
+  it("keeps a start from publishing providers after a later global disable", async () => {
+    const home = await mkdtemp(path.join(tmpdir(), "paseo-plugin-home-"));
+    roots.push(home);
+    const directory = await createPlugin(
+      "provider-race",
+      `export default function contribute(plugin: unknown) { void plugin; return () => undefined; }`,
+    );
+    await writeFile(path.join(directory, "icon.svg"), '<svg viewBox="0 0 24 24"></svg>');
+    const store = createStore(home, {
+      "provider-race": { source: "directory", path: directory, enabled: true },
+    });
+    const running = new Set<string>();
+    const runtime: TestPluginRuntime = {
+      catalog: () => [...running].map((id) => ({ id, clientBundle: "bundle" })),
+      invoke: async () => undefined,
+      getLogs: () => [],
+      clearLogs: () => undefined,
+      getProviderRegistrations: () => {
+        store.patch({ pluginsEnabled: false });
+        return [
+          {
+            id: "plugin-agent",
+            label: "Plugin agent",
+            iconPath: "icon.svg",
+            hasCatalogCacheKey: false,
+          },
+        ];
+      },
+      connectProvider: async () => {
+        throw new Error("not opened by this test");
+      },
+      startPlugin: async (pluginId) => {
+        running.add(pluginId);
+      },
+      stopPluginById: async (pluginId) => running.delete(pluginId),
+      stopAll: async () => {
+        running.clear();
+      },
+      subscribe: () => () => undefined,
+      bindPaseoSessionHost: () => undefined,
+    };
+    const service = new PluginService(pino({ level: "silent" }), store, "0.4.0", { runtime });
+
+    await service.start();
+
+    expect(service.getProviderRegistrations()).toEqual([]);
+    expect(service.catalog()).toEqual([]);
+    expect(
+      (await service.listPlugins()).map(({ id, status, loading }) => ({ id, status, loading })),
+    ).toEqual([{ id: "provider-race", status: "disabled", loading: undefined }]);
+  });
+
+  it("loads a real plugin once for overlapping reloads and again for a later one", async () => {
+    const home = await mkdtemp(path.join(tmpdir(), "paseo-plugin-home-"));
+    roots.push(home);
+    const directory = await createPlugin(
+      "real-once",
+      `export default function contribute(plugin: unknown) { void plugin; return () => undefined; }`,
+    );
+    const service = createService(home);
+    await service.start();
+    await service.installDirectory({ path: directory });
+    const loads = () =>
+      service.getLogs("real-once").filter((entry) => entry.message === "[paseo] Loading plugin")
+        .length;
+    expect(loads()).toBe(1);
+
+    const first = service.reloadPlugin("real-once");
+    const second = service.reloadPlugin("real-once");
+    await expect(Promise.all([first, second])).resolves.toEqual([
+      expect.objectContaining({ id: "real-once", status: "running" }),
+      expect.objectContaining({ id: "real-once", status: "running" }),
+    ]);
+    expect(loads()).toBe(2);
+
+    await expect(service.reloadPlugin("real-once")).resolves.toMatchObject({ status: "running" });
+    expect(loads()).toBe(3);
+    await service.stopAllPlugins();
+  }, 20_000);
+
+  it("announces loading start and settle around a configured install", async () => {
     const home = await mkdtemp(path.join(tmpdir(), "paseo-plugin-home-"));
     roots.push(home);
     const successful = await createPlugin(
@@ -980,16 +1311,33 @@ export default function contribute(plugin: unknown) {
       `export default function contribute(plugin: unknown) { void plugin; throw new Error("startup exploded"); }`,
     );
     const service = createService(home);
-    const events: string[] = [];
-    service.subscribe((pluginId) => events.push(pluginId));
+    const announcements: Array<Promise<{ id: string; status: string; loading: boolean }>> = [];
+    const readPlugin = async (pluginId: string) => {
+      const plugins = await service.listPlugins();
+      for (const plugin of plugins) {
+        if (plugin.id === pluginId) {
+          return { id: plugin.id, status: plugin.status, loading: plugin.loading === true };
+        }
+      }
+      throw new Error(`Plugin missing from announcement: ${pluginId}`);
+    };
+    service.subscribe((pluginId) => {
+      announcements.push(readPlugin(pluginId));
+    });
     await service.start();
 
     await service.installDirectory({ path: successful });
-    expect(events).toEqual(["successful-install"]);
+    expect(await Promise.all(announcements)).toMatchObject([
+      { id: "successful-install", status: "failed", loading: true },
+      { id: "successful-install", status: "running", loading: false },
+    ]);
 
-    events.length = 0;
+    announcements.length = 0;
     await expect(service.installDirectory({ path: failed })).rejects.toThrow("startup exploded");
-    expect(events).toEqual(["failed-install"]);
+    expect(await Promise.all(announcements)).toMatchObject([
+      { id: "failed-install", status: "failed", loading: true },
+      { id: "failed-install", status: "failed", loading: false },
+    ]);
     await service.stopAllPlugins();
   });
 

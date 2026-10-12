@@ -1769,8 +1769,9 @@ console.error("Issue refresh failed", error);
 ```
 
 Paseo adds `[paseo]` entries when the plugin starts loading, becomes ready, starts stopping, and has
-stopped. It records compilation and load failures as stderr entries, including failures that happen
-before the plugin subprocess starts. Paseo also captures output emitted during initialization, RPC
+stopped, and records how long compilation took and how long the plugin subprocess took to come up. It
+records compilation and load failures as stderr entries, including failures that happen before the
+plugin subprocess starts. Paseo also captures output emitted during initialization, RPC
 handlers, cleanup, and process failure. Protocol traffic uses a separate channel, so `console.log()`
 cannot corrupt plugin RPCs.
 
@@ -2016,6 +2017,11 @@ activation retains the previous installation. Manual app update review is not av
 Put `--host <url>` before a management command when the target is not the CLI's default daemon. `remove`
 never deletes a directory source; it deletes managed files for Git and npm sources. The install-time
 `--id` is the runtime ID and allows the same directory or repository to be installed more than once.
+
+Reloads are per plugin and shared: a reload requested while one is already running is the same
+operation, whichever client asked, and `ls` shows `loading` while a start or reload is in flight.
+`paseo plugin reload <id>` waits for the plugin to become ready, including loads that run past the
+client's request timeout.
 
 > **Trust every plugin you add.** `paseo plugin add` and `paseo plugin install` mean “I trust this codebase.” Server code and preparation commands run unsandboxed with the daemon user's access on the daemon host; client contributions run inside Paseo. Dependencies and future updates are part of that decision. With the global `--host` option, commands run on the remote daemon host.
 

@@ -2,6 +2,7 @@ import { z } from "zod";
 import { describe, expect, it } from "vitest";
 import {
   MutableDaemonConfigSchema,
+  PluginStatusSchema,
   SessionInboundMessageSchema,
   SessionOutboundMessageSchema,
   StatusMessageSchema,
@@ -170,6 +171,27 @@ describe("plugin protocol compatibility", () => {
       },
     });
     expect(older.payload.features?.pluginGitManagement).toBeUndefined();
+  });
+
+  it("carries plugin loading state without widening the closed status set", () => {
+    const response = {
+      type: "plugin.list.response",
+      payload: {
+        requestId: "list",
+        plugins: [
+          {
+            id: "example",
+            path: "/plugins/example",
+            enabled: true,
+            status: "failed",
+            loading: true,
+          },
+        ],
+      },
+    };
+    expect(SessionOutboundMessageSchema.parse(response)).toEqual(response);
+    // Older clients validate `status` against the closed set, so a load can never become a status value.
+    expect(PluginStatusSchema.safeParse("loading").success).toBe(false);
   });
 
   it("uses a namespaced snapshot RPC for structured plugin logs", () => {

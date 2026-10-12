@@ -1,6 +1,7 @@
 import { createInterface } from "node:readline/promises";
 import { reviewPluginUpdates, type UpdateOutcome } from "./update.js";
 import { Command } from "commander";
+import type { DaemonClient } from "@getpaseo/client/internal/daemon-client";
 import type { PluginListItem, PluginLogEntry } from "@getpaseo/protocol/messages";
 import {
   formatPluginSourceReference,
@@ -32,7 +33,12 @@ const pluginSchema: OutputSchema<PluginListItem> = {
   idField: "id",
   columns: [
     { header: "PLUGIN", field: "id", width: 20 },
-    { header: "STATUS", field: "status", width: 10 },
+    {
+      header: "STATUS",
+      field: (plugin) =>
+        plugin.loading === true && plugin.status !== "disabled" ? "loading" : plugin.status,
+      width: 10,
+    },
     { header: "ENABLED", field: (plugin) => (plugin.enabled ? "yes" : "no"), width: 8 },
     {
       header: "SOURCE",
@@ -168,13 +174,31 @@ export async function runPluginUpdateCommand(
   return { type: "list", data, schema: pluginUpdateSchema };
 }
 
+const PLUGIN_START_REQUEST_TIMEOUT_MS = 30 * 60_000;
+
+/**
+ * A reload or enable compiles and starts the plugin subprocess, which commonly outlasts the client's
+ * default request timeout. Ask for a longer per-request timeout instead: the daemon answers this
+ * request when its own operation settles, so the result is always correlated with the action that
+ * was sent. A timeout stays a timeout, even when another client finishes the same reload later.
+ */
+export async function startPluginAction(
+  client: DaemonClient,
+  action: "reload" | "enable",
+  pluginId: string,
+): Promise<PluginListItem> {
+  return await client[`${action}Plugin`](pluginId, PLUGIN_START_REQUEST_TIMEOUT_MS);
+}
+
 async function act(
   action: "reload" | "enable" | "disable",
   pluginId: string,
   options: PluginOptions,
 ): Promise<SingleResult<PluginListItem>> {
   const data = await withPluginManagementClient(options.daemonTarget, (client) =>
-    client[`${action}Plugin`](pluginId),
+    action === "disable"
+      ? client.disablePlugin(pluginId)
+      : startPluginAction(client, action, pluginId),
   );
   return { type: "single", data, schema: pluginSchema };
 }

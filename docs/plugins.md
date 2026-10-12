@@ -82,8 +82,20 @@ backend code can access the daemon machine, while client contributions run insid
 
 Source changes are explicit. Run `paseo plugin reload <id>` to stop and fully tear down the old
 plugin before compiling and starting from disk. A failed reload stays failed; Paseo does not restore
-the old code. Use `enable`, `disable`, and `remove` to manage one plugin. Removing a directory source
-never deletes it. The global `pluginsEnabled` switch remains available.
+the old code.
+
+Reloads are single-flight per plugin: a request that arrives while a reload or start is already
+running, from any client, joins it rather than queueing a second stop and start. A request after it
+settles starts a new reload, a failure clears the flight, and operations for different plugins stay
+independent. Plugin list items carry `loading: true` from the request until the operation settles,
+so clients show a load instead of the `failed` status a stop leaves behind; `status` keeps its
+closed set for older clients.
+Loads can take minutes: `paseo plugin reload` asks for a longer per-request timeout and takes its
+answer from that request's own settled operation, so a completion by another client never reports
+the reload as done and the action is never resent.
+
+Use `enable`, `disable`, and `remove` to manage one plugin. Removing a directory source never
+deletes it. The global `pluginsEnabled` switch remains available.
 
 ## Install a Git source
 
@@ -161,9 +173,13 @@ candidate, and the existing installed and running version stays untouched. On a 
 of this happens on the remote daemon host.
 
 Server contributions can write to stdout and stderr with normal Node logging. Paseo adds `[paseo]`
-entries for loading, ready, stopping, and stopped transitions. Compilation and load failures are
+entries for loading, ready, stopping, and stopped transitions, plus the compile and subprocess startup
+durations that separate a slow build from a plugin whose process never comes up. Compilation and load failures are
 recorded as stderr entries before a subprocess exists. Inspect the recent in-memory
-tail from the host plugin settings or with `paseo plugin logs <id>`. Git preparation commands are
+tail from the host plugin settings or with `paseo plugin logs <id>`. Compilation itself runs in a
+short-lived subprocess: boundary traversal parses every reachable file and resolves each import
+through synchronous file system calls, which would stall every connected client if it ran on the
+daemon's event loop. Git preparation commands are
 recorded in `$PASEO_HOME/daemon.log` before a plugin exists, rather than the plugin log tail. Reload, disable, and process
 failure retain the tail; removing the plugin clears it. Daemon restarts do not retain the tail, but
 structured copies remain in `$PASEO_HOME/daemon.log`. Plugin output can contain secrets, so do not

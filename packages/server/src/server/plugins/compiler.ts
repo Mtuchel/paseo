@@ -416,13 +416,15 @@ async function compileTarget(entryPath: string, target: PluginBuildTarget): Prom
   return wrapCommonJsBundle(makeHermesInteropEager(output));
 }
 
+export interface PluginBundles {
+  clientBundle: string | null;
+  serverBundle: string | null;
+}
+
 export async function compilePlugin(entryPaths: {
   client: string | null;
   server: string | null;
-}): Promise<{
-  clientBundle: string | null;
-  serverBundle: string | null;
-}> {
+}): Promise<PluginBundles> {
   const [clientBundle, serverBundle] = await Promise.all([
     entryPaths.client ? compileTarget(entryPaths.client, "client") : null,
     entryPaths.server ? compileTarget(entryPaths.server, "server") : null,

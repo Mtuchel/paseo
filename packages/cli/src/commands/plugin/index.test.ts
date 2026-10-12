@@ -71,12 +71,15 @@ vi.mock("../../utils/client.js", () => ({
 }));
 
 import { render } from "../../output/index.js";
+import { DaemonConnectionError, type DaemonClient } from "@getpaseo/client/internal/daemon-client";
+import type { PluginListItem } from "@getpaseo/protocol/messages";
 import {
   createPluginCommand,
   runPluginInstallCommand,
   runPluginUpdateCommand,
   runPluginListCommand,
   runPluginLogsCommand,
+  startPluginAction,
 } from "./index.js";
 
 describe("plugin management commands", () => {
@@ -129,6 +132,17 @@ describe("plugin management commands", () => {
     const result = await runPluginListCommand("legacy-plugin", { daemonTarget }, {} as never);
 
     expect(result.data.map((plugin) => plugin.id)).toEqual(["legacy-plugin"]);
+  });
+
+  it("lists a plugin as loading while its start is in flight", async () => {
+    features.pluginManagement = true;
+    listPlugins.mockResolvedValueOnce([
+      { id: "slow", path: "/plugins/slow", enabled: true, status: "failed", loading: true },
+    ]);
+
+    const result = await runPluginListCommand(undefined, { daemonTarget }, {} as never);
+
+    expect(render(result, { noColor: true })).toContain("loading");
   });
 
   it("requires plugin log support before attempting the RPC", async () => {
@@ -382,6 +396,39 @@ describe("reviewed plugin update workflow", () => {
         reviewPluginUpdates(f.client, { pluginId: "review" }, { ...f.interaction, ...flags }),
       ).rejects.toThrow("Confirmation required");
       expect(f.applied).toEqual([]);
+    },
+  );
+});
+
+describe("plugin reload readiness tracking", () => {
+  function requestTimeout(): DaemonConnectionError {
+    return new DaemonConnectionError(
+      "Timeout waiting for message (300000ms)",
+      "DAEMON_REQUEST_TIMEOUT",
+    );
+  }
+
+  it.each(["reload", "enable"] as const)(
+    "keeps a timed-out %s a failure even when the plugin later reads running",
+    async (action) => {
+      const manage = vi.fn(async (): Promise<PluginListItem> => {
+        throw requestTimeout();
+      });
+      const laterPlugins = vi.fn(async () => [
+        { id: "slow", path: "/plugins/slow", enabled: true, status: "running" as const },
+      ]);
+      const client = {
+        [`${action}Plugin`]: manage,
+        listPlugins: laterPlugins,
+      } as unknown as DaemonClient;
+
+      // Another client may finish the same reload after our request times out. The result stays
+      // correlated with the request we sent, so a later "running" cannot report our reload as done.
+      await expect(startPluginAction(client, action, "slow")).rejects.toThrow(
+        "Timeout waiting for message",
+      );
+      expect(manage).toHaveBeenCalledTimes(1);
+      expect(laterPlugins).not.toHaveBeenCalled();
     },
   );
 });
