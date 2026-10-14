@@ -380,6 +380,9 @@ async function main(): Promise<void> {
         ["plugin", "add", `git:${pathToFileURL(slowRepository).href}`, "--json"],
         { timeout: 180_000 },
       );
+      // A failed launch must not arrive as an unhandled rejection: that ends this direct Node run
+      // before the finally block below releases the build gate. Its result is still asserted.
+      void slowInstall.catch(() => undefined);
       await waitFor(
         async () =>
           readFile(buildStarted, "utf8").then(
@@ -400,6 +403,8 @@ async function main(): Promise<void> {
         ],
         { timeout: 180_000 },
       );
+      // Same as the install above: a launch failure must not end the run before the cleanup.
+      void slowReload.catch(() => undefined);
       const reloadRequestedAt = await reloadObserver.waitForRequest("plugin.reload.request");
 
       // The interim listing is not the reload's outcome: it still reports the plugin running and
